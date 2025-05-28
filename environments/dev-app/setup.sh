@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # setup.sh - Configuration script for Image Management API
-# Docker-specific version
+# Docker-specific version with virtual environment support
 
 # Define colors for messages
 GREEN='\033[0;32m'
@@ -47,45 +47,30 @@ log "Installing essential packages..."
 
 if [[ "$OS" == *"Ubuntu"* ]] || [[ "$OS" == *"Debian"* ]]; then
     # Try to update repositories for the correct architecture
-    apt-get update -y || {
-        warning "Failed apt-get update. Trying to configure for $ARCH architecture..."
-        # Configure repositories for specific architecture
-        dpkg --add-architecture $ARCH
-        apt-get update -y || warning "Failed to update repositories. Continuing anyway..."
-    }
+    apt-get update -y || warning "Failed to update repositories. Continuing anyway..."
     
-    # Try to install Python and pip adapted to architecture
-    apt-get install -y python3 python3-pip python3-venv || {
-        warning "Failed standard installation. Trying alternative method..."
-        
-        # Alternative method: use apt-get install with --no-install-recommends to minimize issues
-        apt-get install -y --no-install-recommends python3-minimal python3-pip || {
-            error "Could not install Python. Checking if it's already installed..."
-            
-            # Check if Python is already available under another name
-            if command -v python >/dev/null 2>&1; then
-                log "Python is already installed as 'python'"
-                ln -sf $(which python) /usr/bin/python3 || warning "Could not create symbolic link"
-            else
-                error "Python is not available. Setup may fail."
-            fi
+    # Install Python and venv support
+    apt-get install -y python3 python3-venv python3-full || {
+        error "Failed to install Python and virtual environment support. Trying minimal install..."
+        apt-get install -y --no-install-recommends python3-minimal python3-venv || {
+            error "Could not install Python requirements. Setup may fail."
         }
     }
 elif [[ "$OS" == *"Alpine"* ]]; then
     apk update
-    apk add python3 py3-pip
+    apk add python3 py3-pip py3-virtualenv
 else
     warning "Unrecognized operating system: $OS. Trying to install Python via generic method..."
     
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -y
-        apt-get install -y python3 python3-pip
+        apt-get install -y python3 python3-venv
     elif command -v apk >/dev/null 2>&1; then
         apk update
-        apk add python3 py3-pip
+        apk add python3 py3-virtualenv
     elif command -v yum >/dev/null 2>&1; then
         yum -y update
-        yum -y install python3 python3-pip
+        yum -y install python3 python3-virtualenv
     else
         error "Could not determine package manager. Manual installation required."
     fi
@@ -94,61 +79,59 @@ fi
 # Verify if Python was installed correctly
 if command -v python3 >/dev/null 2>&1; then
     PYTHON_CMD="python3"
-elif command -v python >/dev/null 2>&1; then
-    PYTHON_CMD="python"
-    log "Using 'python' instead of 'python3'"
 else
-    error "Python is not available after installation attempt. Creating fallback script..."
-    PYTHON_CMD="python3"
-    
-    # Create a fallback script
-    echo '#!/bin/sh
-echo "Python is not available. Please install Python 3.8+ manually."
-exit 1' > /usr/local/bin/python3_fallback
-    chmod +x /usr/local/bin/python3_fallback
-    PYTHON_CMD="/usr/local/bin/python3_fallback"
-fi
-
-# Verify if pip was installed correctly
-if command -v pip3 >/dev/null 2>&1; then
-    PIP_CMD="pip3"
-elif command -v pip >/dev/null 2>&1; then
-    PIP_CMD="pip"
-    log "Using 'pip' instead of 'pip3'"
-else
-    # Try to install pip using get-pip.py
-    log "pip not found. Trying to install it using get-pip.py..."
-    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-    $PYTHON_CMD get-pip.py || {
-        error "Failed to install pip. Creating fallback script..."
-        
-        # Create a fallback script for pip
-        echo '#!/bin/sh
-echo "pip is not available. Please install pip manually."
-exit 1' > /usr/local/bin/pip_fallback
-        chmod +x /usr/local/bin/pip_fallback
-        PIP_CMD="/usr/local/bin/pip_fallback"
-    }
-    rm -f get-pip.py
+    error "Python3 is not available. Installation failed."
+    exit 1
 fi
 
 # Check Python version
-if command -v $PYTHON_CMD >/dev/null 2>&1; then
-    PYTHON_VERSION=$($PYTHON_CMD -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null)
-    log "Using Python $PYTHON_VERSION"
-else
-    warning "Could not determine Python version."
-    PYTHON_VERSION="unknown"
-fi
+PYTHON_VERSION=$($PYTHON_CMD --version 2>&1)
+log "Using $PYTHON_VERSION"
 
 # Create directory for local storage
 log "Setting up local storage directory..."
 mkdir -p storage/teams
 
+# Create virtual environment
+log "Creating virtual environment..."
+APP_DIR="$(pwd)"
+VENV_DIR="${APP_DIR}/.venv"
+
+if [ ! -d "$VENV_DIR" ]; then
+    $PYTHON_CMD -m venv $VENV_DIR || {
+        error "Failed to create virtual environment. Make sure python3-venv is installed."
+        exit 1
+    }
+else
+    log "Virtual environment already exists at $VENV_DIR"
+fi
+
+# Activate virtual environment
+log "Activating virtual environment..."
+source $VENV_DIR/bin/activate || {
+    error "Failed to activate virtual environment."
+    exit 1
+}
+
+# Now pip should be available from the virtual environment
+if command -v pip >/dev/null 2>&1; then
+    PIP_CMD="pip"
+else
+    error "pip not available in virtual environment. Something is wrong with the venv setup."
+    exit 1
+fi
+
+# Upgrade pip in the virtual environment
+$PIP_CMD install --upgrade pip
+
 # Install dependencies
-log "Installing dependencies..."
+log "Installing dependencies in virtual environment..."
 if [ -f "requirements.txt" ]; then
-    $PIP_CMD install -r requirements.txt || warning "Failed to install dependencies from requirements.txt."
+    $PIP_CMD install -r requirements.txt || {
+        warning "Failed to install dependencies from requirements.txt."
+        warning "Installing core dependencies..."
+        $PIP_CMD install fastapi uvicorn sqlalchemy psycopg2-binary
+    }
 else
     warning "requirements.txt file not found. Creating basic file..."
     
@@ -167,10 +150,10 @@ passlib[bcrypt]>=1.7.4,<1.8.0
 pillow>=9.0.0,<10.0.0
 EOF
     
-    log "Attempting to install basic dependencies..."
+    log "Installing new dependencies..."
     $PIP_CMD install -r requirements.txt || {
         warning "Failed to install all dependencies. Trying minimal installation..."
-        $PIP_CMD install fastapi uvicorn sqlalchemy || error "Failed minimal installation."
+        $PIP_CMD install fastapi uvicorn sqlalchemy
     }
 fi
 
@@ -187,7 +170,7 @@ POSTGRES_DB=image_management
 SQLALCHEMY_DATABASE_URI=postgresql://postgres:postgres@db/image_management # pragma: allowlist secret
 
 # API Settings
-SECRET_KEY=$(openssl rand -hex 32)
+SECRET_KEY=$(openssl rand -hex 32 2>/dev/null || echo "replace_with_secure_random_key")
 API_KEY_PREFIX=imapi
 API_KEY_LENGTH=32
 ENVIRONMENT=development
@@ -243,74 +226,35 @@ if [ ! -d "app" ]; then
     touch app/middleware/__init__.py
 fi
 
-# Check if main.py file exists
-if [ ! -f "app/main.py" ]; then
-    warning "app/main.py not found. Creating basic file..."
-    cat > app/main.py << EOF
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import logging
-
-from app.core.config import settings
-
-# Configure logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
-
-# Create FastAPI application
-app = FastAPI(
-    title="Image Management API",
-    description="API for image management with semantic search capabilities",
-    version="0.1.0",
-)
-
-# Configure CORS
-if settings.BACKEND_CORS_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-@app.get("/")
-def root():
-    return {"message": "Image Management API"}
-
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
-
-# Include routers here when ready
-# example: app.include_router(api_router)
+# Create a convenient wrapper script to run the application
+log "Creating run wrapper script..."
+cat > run_app.sh << EOF
+#!/bin/bash
+# Activate virtual environment and run the application
+source $VENV_DIR/bin/activate
+python run.py
 EOF
-    warning "Basic main.py file created. You'll need to implement it completely."
-fi
+chmod +x run_app.sh
 
-# Optional: create a basic script for database.py if it doesn't exist
-if [ ! -f "app/db/session.py" ]; then
-    warning "app/db/session.py not found. Creating basic file..."
-    cat > app/db/session.py << EOF
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+# Create a basic init_db script if it doesn't exist
+if [ ! -f "app/db/init_db.py" ]; then
+    warning "app/db/init_db.py not found. Creating a basic one..."
+    cat > app/db/init_db.py << EOF
+# app/db/init_db.py
+from sqlalchemy.orm import Session
 
-from app.core.config import settings
-
-engine = create_engine(settings.SQLALCHEMY_DATABASE_URI, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def init_db(db: Session) -> None:
+    """Initialize the database with default data."""
+    # You can add code here to create initial data
+    # Example:
+    # from app.models.team import Team
+    # team = db.query(Team).filter(Team.name == "Default").first()
+    # if not team:
+    #     team = Team(name="Default", description="Default team")
+    #     db.add(team)
+    #     db.commit()
+    
+    print("Database initialized!")
 EOF
 fi
 
@@ -324,9 +268,14 @@ log "  2. Environment variables in .env match your configuration"
 log "  3. The volume for persistent storage is configured"
 echo 
 log "To start the application inside the container:"
-log "  $ python run.py"
+log "  $ ./run_app.sh  # This will activate the virtual environment and start the app"
+log "  or"
+log "  $ source .venv/bin/activate && python run.py"
 echo 
 log "The API will be available on the port defined in your Dockerfile/docker-compose"
 echo 
+
+# Deactivate virtual environment
+deactivate
 
 exit 0
