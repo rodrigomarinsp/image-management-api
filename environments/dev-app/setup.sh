@@ -51,10 +51,12 @@ touch app/schemas/__init__.py
 touch app/services/__init__.py
 touch app/middleware/__init__.py
 
-# Install system packages
+# Install system packages including PostgreSQL development headers
 log "Installing essential system packages..."
 apt-get update -y
-apt-get install -y python3 python3-venv python3-pip curl
+apt-get install -y python3 python3-venv python3-pip curl \
+                   postgresql postgresql-contrib postgresql-server-dev-all \
+                   libpq-dev gcc python3-dev
 
 # Set up virtual environment
 log "Setting up virtual environment..."
@@ -89,43 +91,31 @@ fi
 log "Upgrading pip..."
 $VENV_PIP install --upgrade pip wheel setuptools
 
-# Install core dependencies
-log "Installing dependencies..."
-$VENV_PIP install fastapi==0.103.1
-$VENV_PIP install uvicorn==0.23.2
-$VENV_PIP install sqlalchemy==2.0.20
-$VENV_PIP install psycopg2-binary==2.9.7
-$VENV_PIP install python-multipart==0.0.6
-$VENV_PIP install pydantic==2.0.3
-$VENV_PIP install python-dotenv==1.0.0
-$VENV_PIP install loguru==0.7.0
+# Install core dependencies one by one, starting with psycopg2-binary since it's problematic
+log "Installing psycopg2-binary (may take some time)..."
+$VENV_PIP install psycopg2-binary
+
+log "Installing other dependencies..."
+$VENV_PIP install fastapi uvicorn sqlalchemy python-multipart pydantic python-dotenv loguru
 
 # Special handling for pydantic-settings
 log "Installing pydantic-settings with special handling..."
-$VENV_PIP uninstall -y pydantic-settings
-$VENV_PIP install pydantic-settings==2.0.3
+$VENV_PIP install pydantic-settings
 
-# Create config.py with fallback
+# Create alternative config.py that doesn't rely on pydantic_settings
 log "Creating app/core/config.py..."
 cat > "app/core/config.py" << EOF
 # app/core/config.py
 import os
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# Try to use pydantic_settings or fallback to pydantic
-try:
-    from pydantic_settings import BaseSettings
-    from dotenv import load_dotenv
-    load_dotenv()
-    print("Using pydantic_settings.BaseSettings")
-except ImportError:
-    # Fallback to regular pydantic
-    from pydantic import BaseModel as BaseSettings
-    from dotenv import load_dotenv
-    load_dotenv()
-    print("Fallback: Using pydantic.BaseModel instead of pydantic_settings.BaseSettings")
+# Load environment variables from .env file
+load_dotenv()
 
-class Settings(BaseSettings):
+# Simple settings class using pydantic BaseModel instead of BaseSettings
+class Settings(BaseModel):
     PROJECT_NAME: str = "Image Management API"
     API_V1_STR: str = "/api/v1"
     SECRET_KEY: str = os.getenv("SECRET_KEY", "default-secret-key")
@@ -202,9 +192,38 @@ def health_check():
     return {"status": "ok"}
 EOF
 
+# Create database session.py
+log "Creating app/db/session.py..."
+cat > "app/db/session.py" << EOF
+# app/db/session.py
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+from app.core.config import settings
+
+# Create SQLAlchemy engine
+engine = create_engine(settings.SQLALCHEMY_DATABASE_URI, pool_pre_ping=True)
+
+# Create session factory
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Create base class for models
+Base = declarative_base()
+
+def get_db():
+    """Dependency to get DB session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+EOF
+
 # Create run.py
 log "Creating run.py..."
 cat > "run.py" << EOF
+# run.py
 import uvicorn
 
 if __name__ == "__main__":
@@ -245,7 +264,15 @@ source "$VENV_DIR/bin/activate"
 # Set Python path
 export PYTHONPATH="$PROJECT_DIR:\$PYTHONPATH"
 
+# Print environment info
 echo "Starting Image Management API..."
+echo "Python version: \$(python --version)"
+echo "Current directory: \$(pwd)"
+echo "Python path: \$PYTHONPATH"
+echo "Installed packages:"
+pip list
+
+# Run the application
 python run.py
 EOF
 chmod +x run_app.sh
@@ -253,15 +280,15 @@ chmod +x run_app.sh
 # Create requirements.txt
 log "Creating requirements.txt..."
 cat > "requirements.txt" << EOF
-fastapi==0.103.1
-uvicorn==0.23.2
-sqlalchemy==2.0.20
-psycopg2-binary==2.9.7
-python-multipart==0.0.6
-pydantic==2.0.3
-pydantic-settings==2.0.3
-python-dotenv==1.0.0
-loguru==0.7.0
+fastapi>=0.95.0
+uvicorn>=0.21.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+python-multipart>=0.0.5
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+loguru>=0.6.0
 EOF
 
 # Verify the environment
@@ -276,6 +303,10 @@ log "To run the application:"
 log "  $ ./run_app.sh"
 echo ""
 log "The API will be available at: http://localhost:8000"
+echo ""
+log "NOTE: For this app to connect to PostgreSQL, you need to:"
+log "  1. Either start a PostgreSQL container named 'db'"
+log "  2. Or modify .env to point to your existing PostgreSQL server"
 echo ""
 
 # Deactivate virtual environment
